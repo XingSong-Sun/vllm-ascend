@@ -19,7 +19,6 @@ import msgspec
 import numpy as np
 import numpy.typing as npt
 import torch
-import torch_npu
 import zmq
 from mooncake.engine import TransferEngine  # type: ignore
 from vllm import envs
@@ -46,11 +45,41 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
-from vllm_ascend import envs as ascend_envs
-from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
-from vllm_ascend.utils import enable_custom_op, is_vl_model
+
+# Platform detection: check if running on Ascend NPU or CUDA GPU
+_IS_NPU_PLATFORM = False
+try:
+    import torch_npu  # noqa: F401
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        _IS_NPU_PLATFORM = True
+except ImportError:
+    pass
+
+# Conditional imports for Ascend-specific modules
+if _IS_NPU_PLATFORM:
+    from vllm_ascend import envs as ascend_envs
+    from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+    from vllm_ascend.utils import enable_custom_op, is_vl_model
+else:
+    ascend_envs = None  # type: ignore[assignment]
+
+    def get_ascend_config():  # type: ignore[misc]
+        return None
+
+    def init_ascend_config(vllm_config):  # type: ignore[misc]
+        pass
+
+    def enable_custom_op():  # type: ignore[misc]
+        return False
+
+    def is_vl_model(vllm_config):  # type: ignore[misc]
+        """Fallback VL model check for non-Ascend platforms."""
+        if vllm_config and vllm_config.model_config:
+            hf_config = vllm_config.model_config.hf_config.to_dict()
+            return "vision_config" in hf_config or "thinker_config" in hf_config
+        return False
 
 # isort: off
 if TYPE_CHECKING:
@@ -62,6 +91,33 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+# GPU decode → NPU prefill: ask NPU to PUSH KV blocks to GPU memory.
+DO_PUSH_KV_MSG = b"do_push_kv_msg"
+DO_PUSH_ACK = b"do_push_ack"
+DO_PUSH_ERR = b"do_push_err"
+
+
+class GpuPushRequest(msgspec.Struct, omit_defaults=True, dict=True):
+    """Payload for DO_PUSH_KV_MSG.
+
+    The GPU decode node sends this to the NPU prefill node so that the NPU
+    can WRITE (batch_transfer_sync_write) KV blocks directly into GPU memory.
+
+    Fields:
+        gpu_rpc_port: TE RPC port on the GPU decode node.
+        gpu_host: IP of the GPU decode node.
+        gpu_kv_caches_base_addr: base addresses of the GPU KV cache (one per
+            layer, same layout as MooncakeAgentMetadata.kv_caches_base_addr).
+        req_ids: request IDs corresponding to the entries below.
+        remote_block_ids: per-request list of NPU block IDs (source).
+        local_block_ids: per-request list of GPU block IDs (destination).
+    """
+    gpu_rpc_port: int
+    gpu_host: str
+    gpu_kv_caches_base_addr: list[int]
+    req_ids: list[str]
+    remote_block_ids: list[list[int]]
+    local_block_ids: list[list[int]]
 
 
 class RemotePortInfo(TypedDict):
@@ -196,6 +252,8 @@ class KVCacheSendingThread(threading.Thread):
         ready_event: threading.Event,
         kv_caches: dict[str, Any],
         pcp_rank: int,
+        engine: Any | None = None,
+        block_len: list[int] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingThread")
         self.tp_rank = tp_rank
@@ -211,6 +269,9 @@ class KVCacheSendingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.pcp_rank = pcp_rank
         self.port_send_num: dict[str, int] = {}
+        # Transfer engine & block length list — needed for DO_PUSH_KV_MSG
+        self.engine = engine
+        self.block_len: list[int] = block_len or []
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -252,6 +313,7 @@ class KVCacheSendingThread(threading.Thread):
         logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
+        push_req_decoder = msgspec.msgpack.Decoder(type=GpuPushRequest)
         while True:
             try:
                 frames = sock.recv_multipart()
@@ -293,6 +355,72 @@ class KVCacheSendingThread(threading.Thread):
                             # If the socket is not ready, retry sending.
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
+                elif msg[0] == DO_PUSH_KV_MSG:
+                    # GPU decode asks NPU to PUSH KV blocks into GPU memory via
+                    # RDMA WRITE. This is needed because GPU's rdma TE cannot
+                    # RDMA READ from NPU HBM device addresses.
+                    try:
+                        push_req: GpuPushRequest = push_req_decoder.decode(msg[1])
+                        if self.engine is None or not self.block_len:
+                            raise RuntimeError("KVCacheSendingThread: engine or block_len not initialised")
+
+                        npu_base_addrs = self.metadata.kv_caches_base_addr
+                        gpu_base_addrs = push_req.gpu_kv_caches_base_addr
+                        num_layers = min(len(npu_base_addrs), len(gpu_base_addrs))
+                        block_length = len(self.block_len)
+
+                        src_ptrs: list[int] = []
+                        dst_ptrs: list[int] = []
+                        lengths_list: list[int] = []
+
+                        for req_idx, req_id in enumerate(push_req.req_ids):
+                            npu_block_ids = push_req.remote_block_ids[req_idx]
+                            gpu_block_ids = push_req.local_block_ids[req_idx]
+                            if not npu_block_ids or not gpu_block_ids:
+                                continue
+
+                            num_npu = len(npu_block_ids)
+                            num_gpu = len(gpu_block_ids)
+                            if num_gpu > num_npu:
+                                gpu_block_ids = gpu_block_ids[-num_npu:]
+                            elif num_gpu < num_npu:
+                                logger.error(
+                                    "DO_PUSH_KV req %s: gpu blocks(%d) < npu blocks(%d)",
+                                    req_id, num_gpu, num_npu,
+                                )
+                                continue
+
+                            grp_npu, grp_gpu = group_concurrent_contiguous(npu_block_ids, gpu_block_ids)
+
+                            for layer_idx in range(num_layers):
+                                blk_len = self.block_len[layer_idx % block_length]
+                                npu_layer_base = npu_base_addrs[layer_idx]
+                                gpu_layer_base = gpu_base_addrs[layer_idx]
+                                for g_npu, g_gpu in zip(grp_npu, grp_gpu):
+                                    src_ptrs.append(npu_layer_base + g_npu[0] * blk_len)
+                                    dst_ptrs.append(gpu_layer_base + g_gpu[0] * blk_len)
+                                    lengths_list.append(blk_len * len(g_npu))
+
+                        if src_ptrs:
+                            remote_session = f"{push_req.gpu_host}:{push_req.gpu_rpc_port}"
+                            ret = self.engine.batch_transfer_sync_write(
+                                remote_session, src_ptrs, dst_ptrs, lengths_list
+                            )
+                            if ret != 0:
+                                raise RuntimeError(
+                                    f"batch_transfer_sync_write failed ret={ret}"
+                                )
+
+                        # Data transfer done. Task life-cycle (reqs_to_process
+                        # tracking) is managed by the subsequent DONE_RECVING_MSG
+                        # that the GPU decode side sends with the NPU-side
+                        # remote_request_id. Do NOT call update_done_task_count
+                        # here because push_req.req_ids are GPU-side IDs and
+                        # are never registered in reqs_to_process on this node.
+                        sock.send_multipart((identity, b"", encoder.encode((DO_PUSH_ACK, push_req.req_ids))))
+                    except Exception as push_exc:
+                        logger.error("DO_PUSH_KV_MSG handling failed: %s", push_exc, exc_info=True)
+                        sock.send_multipart((identity, b"", encoder.encode((DO_PUSH_ERR, str(push_exc)))))
                 else:
                     logger.error("Connection listener got unexpected message %s", msg)
             except Exception as e:
@@ -565,8 +693,10 @@ class KVCacheRecvingThread(threading.Thread):
         # the KV transmission.
         is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
         need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
-        need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
-        use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
+        _ascend_config = get_ascend_config()
+        need_nz_cache = (_ascend_config.enable_kv_nz if _ascend_config else False) and is_kv_transfer_end
+        use_fused_op = (ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
+                        if ascend_envs is not None else False)
         if need_nz_cache or need_cat_cache:
             # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
             if use_fused_op and enable_custom_op():
@@ -580,6 +710,10 @@ class KVCacheRecvingThread(threading.Thread):
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
+        if not _IS_NPU_PLATFORM:
+            # Fused op is NPU-specific, fall back to non-fused path on GPU
+            self.reformat_kv_cache(block_ids, tp_num_need_pulls, need_cat_cache=True, need_nz_cache=False)
+            return
         # Get necessary parameters
         k_cache = list(self.kv_caches.values())[0][0]
         device = k_cache.device
@@ -635,20 +769,32 @@ class KVCacheRecvingThread(threading.Thread):
         # FIXME: Right now, if we skip synchronization at this point, the system
         # will crash in GQA scenarios. However, we still haven't identified the
         # root cause.
-        torch.npu.synchronize()
+        if _IS_NPU_PLATFORM:
+            torch.npu.synchronize()
+        else:
+            torch.cuda.synchronize()
 
         # Process each layer in the KV cache
         for _, (k_cache_layer, v_cache_layer) in self.kv_caches.items():
             # Load cache data into buffers
-            torch_npu.atb.npu_paged_cache_load(
-                k_cache_layer,
-                v_cache_layer,
-                block_table,
-                block_len_tensor,
-                seq_starts=seq_start_tensor,
-                key=k_buffer,
-                value=v_buffer,
-            )
+            if _IS_NPU_PLATFORM:
+                import torch_npu as _torch_npu
+                _torch_npu.atb.npu_paged_cache_load(
+                    k_cache_layer,
+                    v_cache_layer,
+                    block_table,
+                    block_len_tensor,
+                    seq_starts=seq_start_tensor,
+                    key=k_buffer,
+                    value=v_buffer,
+                )
+            else:
+                # GPU fallback: load from paged cache to contiguous buffer
+                for i, block_id in enumerate(flat_block_ids):
+                    start_token = i * self.block_size
+                    end_token = start_token + self.block_size
+                    k_buffer[start_token:end_token] = k_cache_layer[block_id].view(self.block_size, self.num_kv_heads, self.k_head_dim)
+                    v_buffer[start_token:end_token] = v_cache_layer[block_id].view(self.block_size, self.num_kv_heads, self.v_head_dim)
             if need_cat_cache:
                 self._cat_kv_cache(
                     k_cache_layer,
@@ -678,11 +824,25 @@ class KVCacheRecvingThread(threading.Thread):
         v_buffer = _transpose_kv_cache_between_head(v_buffer)
 
         # Reshape and cache the processed buffers
-        torch_npu._npu_reshape_and_cache(
-            key=k_buffer, value=v_buffer, key_cache=k_cache_layer, value_cache=v_cache_layer, slot_indices=slot_mapping
-        )
+        if _IS_NPU_PLATFORM:
+            import torch_npu as _torch_npu
+            _torch_npu._npu_reshape_and_cache(
+                key=k_buffer, value=v_buffer, key_cache=k_cache_layer, value_cache=v_cache_layer, slot_indices=slot_mapping
+            )
+        else:
+            # GPU fallback: scatter KV data back into paged cache
+            for i, slot_idx in enumerate(slot_mapping.tolist()):
+                block_id = slot_idx // self.block_size
+                block_offset = slot_idx % self.block_size
+                k_cache_layer[block_id][block_offset] = k_buffer[i].view(k_cache_layer.shape[-1] if len(k_cache_layer.shape) == 3 else -1)
+                v_cache_layer[block_id][block_offset] = v_buffer[i].view(v_cache_layer.shape[-1] if len(v_cache_layer.shape) == 3 else -1)
 
     def _nz_kv_cache(self, k_cache_layer, v_cache_layer, k_buffer, v_buffer, slot_mapping):
+        if not _IS_NPU_PLATFORM:
+            # NZ format is NPU-specific, skip on GPU
+            logger.warning("NZ KV cache format is only supported on Ascend NPU, skipping.")
+            return
+        import torch_npu as _torch_npu
         nz_fmt_last_dim = 16
         k_cache_layer = k_cache_layer.view(
             -1, self.k_head_dim * self.num_kv_heads // nz_fmt_last_dim, self.block_size, nz_fmt_last_dim
@@ -690,7 +850,7 @@ class KVCacheRecvingThread(threading.Thread):
         v_cache_layer = v_cache_layer.view(
             -1, self.v_head_dim * self.num_kv_heads // nz_fmt_last_dim, self.block_size, nz_fmt_last_dim
         )
-        torch_npu.npu_scatter_pa_kv_cache(k_buffer, v_buffer, k_cache_layer, v_cache_layer, slot_mapping)
+        _torch_npu.npu_scatter_pa_kv_cache(k_buffer, v_buffer, k_cache_layer, v_cache_layer, slot_mapping)
 
     def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int) -> None:
         """Get the metadata from the remote host."""
@@ -909,8 +1069,11 @@ class MooncakeConnectorScheduler:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self.vllm_config = vllm_config
-        init_ascend_config(vllm_config)
-        self.ascend_config = get_ascend_config()
+        if _IS_NPU_PLATFORM:
+            init_ascend_config(vllm_config)
+            self.ascend_config = get_ascend_config()
+        else:
+            self.ascend_config = None
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id = engine_id
         self.local_ip = get_ip()
@@ -1094,7 +1257,8 @@ class MooncakeConnectorWorker:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self._get_prefill_decode_size(vllm_config)
-        os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+        if _IS_NPU_PLATFORM:
+            os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
@@ -1103,7 +1267,7 @@ class MooncakeConnectorWorker:
 
         # Metadata.
         self.vllm_config = vllm_config
-        self.ascend_config = get_ascend_config()
+        self.ascend_config = get_ascend_config() if _IS_NPU_PLATFORM else None
         self.engine_id = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -1254,6 +1418,8 @@ class MooncakeConnectorWorker:
                 ready_event,
                 self.kv_caches,
                 self.pcp_rank,
+                engine=self.engine,
+                block_len=self.block_len,
             )
             self.kv_send_thread.start()
         else:
