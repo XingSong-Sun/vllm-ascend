@@ -48,38 +48,9 @@ from vllm.v1.request import RequestStatus
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
 
-# Platform detection: check if running on Ascend NPU or CUDA GPU
-_IS_NPU_PLATFORM = False
-try:
-    import torch_npu  # noqa: F401
-    if hasattr(torch, 'npu') and torch.npu.is_available():
-        _IS_NPU_PLATFORM = True
-except ImportError:
-    pass
-
-# Conditional imports for Ascend-specific modules
-if _IS_NPU_PLATFORM:
-    from vllm_ascend import envs as ascend_envs
-    from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-    from vllm_ascend.utils import enable_custom_op, is_vl_model
-else:
-    ascend_envs = None  # type: ignore[assignment]
-
-    def get_ascend_config():  # type: ignore[misc]
-        return None
-
-    def init_ascend_config(vllm_config):  # type: ignore[misc]
-        pass
-
-    def enable_custom_op():  # type: ignore[misc]
-        return False
-
-    def is_vl_model(vllm_config):  # type: ignore[misc]
-        """Fallback VL model check for non-Ascend platforms."""
-        if vllm_config and vllm_config.model_config:
-            hf_config = vllm_config.model_config.hf_config.to_dict()
-            return "vision_config" in hf_config or "thinker_config" in hf_config
-        return False
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.utils import enable_custom_op, is_vl_model
 
 # isort: off
 if TYPE_CHECKING:
@@ -694,9 +665,8 @@ class KVCacheRecvingThread(threading.Thread):
         is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
         need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
         _ascend_config = get_ascend_config()
-        need_nz_cache = (_ascend_config.enable_kv_nz if _ascend_config else False) and is_kv_transfer_end
-        use_fused_op = (ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
-                        if ascend_envs is not None else False)
+        need_nz_cache = _ascend_config.enable_kv_nz and is_kv_transfer_end
+        use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
         if need_nz_cache or need_cat_cache:
             # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
             if use_fused_op and enable_custom_op():
@@ -710,10 +680,6 @@ class KVCacheRecvingThread(threading.Thread):
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
-        if not _IS_NPU_PLATFORM:
-            # Fused op is NPU-specific, fall back to non-fused path on GPU
-            self.reformat_kv_cache(block_ids, tp_num_need_pulls, need_cat_cache=True, need_nz_cache=False)
-            return
         # Get necessary parameters
         k_cache = list(self.kv_caches.values())[0][0]
         device = k_cache.device
@@ -769,32 +735,21 @@ class KVCacheRecvingThread(threading.Thread):
         # FIXME: Right now, if we skip synchronization at this point, the system
         # will crash in GQA scenarios. However, we still haven't identified the
         # root cause.
-        if _IS_NPU_PLATFORM:
-            torch.npu.synchronize()
-        else:
-            torch.cuda.synchronize()
+        torch.npu.synchronize()
 
         # Process each layer in the KV cache
         for _, (k_cache_layer, v_cache_layer) in self.kv_caches.items():
             # Load cache data into buffers
-            if _IS_NPU_PLATFORM:
-                import torch_npu as _torch_npu
-                _torch_npu.atb.npu_paged_cache_load(
-                    k_cache_layer,
-                    v_cache_layer,
-                    block_table,
-                    block_len_tensor,
-                    seq_starts=seq_start_tensor,
-                    key=k_buffer,
-                    value=v_buffer,
-                )
-            else:
-                # GPU fallback: load from paged cache to contiguous buffer
-                for i, block_id in enumerate(flat_block_ids):
-                    start_token = i * self.block_size
-                    end_token = start_token + self.block_size
-                    k_buffer[start_token:end_token] = k_cache_layer[block_id].view(self.block_size, self.num_kv_heads, self.k_head_dim)
-                    v_buffer[start_token:end_token] = v_cache_layer[block_id].view(self.block_size, self.num_kv_heads, self.v_head_dim)
+            import torch_npu as _torch_npu
+            _torch_npu.atb.npu_paged_cache_load(
+                k_cache_layer,
+                v_cache_layer,
+                block_table,
+                block_len_tensor,
+                seq_starts=seq_start_tensor,
+                key=k_buffer,
+                value=v_buffer,
+            )
             if need_cat_cache:
                 self._cat_kv_cache(
                     k_cache_layer,
@@ -824,24 +779,12 @@ class KVCacheRecvingThread(threading.Thread):
         v_buffer = _transpose_kv_cache_between_head(v_buffer)
 
         # Reshape and cache the processed buffers
-        if _IS_NPU_PLATFORM:
-            import torch_npu as _torch_npu
-            _torch_npu._npu_reshape_and_cache(
-                key=k_buffer, value=v_buffer, key_cache=k_cache_layer, value_cache=v_cache_layer, slot_indices=slot_mapping
-            )
-        else:
-            # GPU fallback: scatter KV data back into paged cache
-            for i, slot_idx in enumerate(slot_mapping.tolist()):
-                block_id = slot_idx // self.block_size
-                block_offset = slot_idx % self.block_size
-                k_cache_layer[block_id][block_offset] = k_buffer[i].view(k_cache_layer.shape[-1] if len(k_cache_layer.shape) == 3 else -1)
-                v_cache_layer[block_id][block_offset] = v_buffer[i].view(v_cache_layer.shape[-1] if len(v_cache_layer.shape) == 3 else -1)
+        import torch_npu as _torch_npu
+        _torch_npu._npu_reshape_and_cache(
+            key=k_buffer, value=v_buffer, key_cache=k_cache_layer, value_cache=v_cache_layer, slot_indices=slot_mapping
+        )
 
     def _nz_kv_cache(self, k_cache_layer, v_cache_layer, k_buffer, v_buffer, slot_mapping):
-        if not _IS_NPU_PLATFORM:
-            # NZ format is NPU-specific, skip on GPU
-            logger.warning("NZ KV cache format is only supported on Ascend NPU, skipping.")
-            return
         import torch_npu as _torch_npu
         nz_fmt_last_dim = 16
         k_cache_layer = k_cache_layer.view(
@@ -1069,11 +1012,8 @@ class MooncakeConnectorScheduler:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self.vllm_config = vllm_config
-        if _IS_NPU_PLATFORM:
-            init_ascend_config(vllm_config)
-            self.ascend_config = get_ascend_config()
-        else:
-            self.ascend_config = None
+        init_ascend_config(vllm_config)
+        self.ascend_config = get_ascend_config()
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id = engine_id
         self.local_ip = get_ip()
@@ -1257,8 +1197,7 @@ class MooncakeConnectorWorker:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self._get_prefill_decode_size(vllm_config)
-        if _IS_NPU_PLATFORM:
-            os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+        os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
@@ -1267,7 +1206,7 @@ class MooncakeConnectorWorker:
 
         # Metadata.
         self.vllm_config = vllm_config
-        self.ascend_config = get_ascend_config() if _IS_NPU_PLATFORM else None
+        self.ascend_config = get_ascend_config()
         self.engine_id = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
