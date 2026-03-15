@@ -4,6 +4,7 @@ import copy
 import hashlib
 import math
 import os
+import sys
 import queue
 import random
 import struct
@@ -89,6 +90,7 @@ class GpuPushRequest(msgspec.Struct, omit_defaults=True, dict=True):
     req_ids: list[str]
     remote_block_ids: list[list[int]]
     local_block_ids: list[list[int]]
+    gpu_block_len: int = 0  # GPU-side block size in bytes (for heterogeneous block sizes)
 
 
 class RemotePortInfo(TypedDict):
@@ -364,13 +366,18 @@ class KVCacheSendingThread(threading.Thread):
                             grp_npu, grp_gpu = group_concurrent_contiguous(npu_block_ids, gpu_block_ids)
 
                             for layer_idx in range(num_layers):
-                                blk_len = self.block_len[layer_idx % block_length]
+                                npu_blk_len = self.block_len[layer_idx % block_length]
+                                # Use GPU block_len for destination offset when provided,
+                                # otherwise fall back to NPU block_len (homogeneous case).
+                                gpu_blk_len = push_req.gpu_block_len if push_req.gpu_block_len > 0 else npu_blk_len
+                                # Transfer length = min of both: only copy what fits in a GPU block
+                                xfer_len = min(npu_blk_len, gpu_blk_len)
                                 npu_layer_base = npu_base_addrs[layer_idx]
                                 gpu_layer_base = gpu_base_addrs[layer_idx]
                                 for g_npu, g_gpu in zip(grp_npu, grp_gpu):
-                                    src_ptrs.append(npu_layer_base + g_npu[0] * blk_len)
-                                    dst_ptrs.append(gpu_layer_base + g_gpu[0] * blk_len)
-                                    lengths_list.append(blk_len * len(g_npu))
+                                    src_ptrs.append(npu_layer_base + g_npu[0] * npu_blk_len)
+                                    dst_ptrs.append(gpu_layer_base + g_gpu[0] * gpu_blk_len)
+                                    lengths_list.append(xfer_len * len(g_npu))
 
                         if src_ptrs:
                             remote_session = f"{push_req.gpu_host}:{push_req.gpu_rpc_port}"
