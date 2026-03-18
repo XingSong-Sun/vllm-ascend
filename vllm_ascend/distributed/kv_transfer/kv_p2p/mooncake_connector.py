@@ -648,7 +648,7 @@ class KVCacheRecvingThread(threading.Thread):
                 dst_list.append(dst)
                 length_list.append(length)
 
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        ret = self.engine.batch_transfer_sync_write(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
